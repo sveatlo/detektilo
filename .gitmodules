@@ -1,0 +1,4 @@
+[submodule "pkg/tensorflow-models"]
+	path = pkg/tensorflow-models
+	url = git@github.com:tensorflow/models.git
+    ignore = dirty

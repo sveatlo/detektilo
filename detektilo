@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import time
+from pathlib import Path
+
+# add to PYTHONPATH
+sys.path.append(
+    str(Path(__file__).parent / "pkg/tensorflow-models/research"))
+sys.path.append(
+    str(Path(__file__).parent / "pkg/tensorflow-models/research/slim"))
+
+import PIL
+import click
+import cv2
+import imagehash
+import numpy as np
+import matplotlib
+
+
+from utils_commands import utils_group
+from pkg import Detector, Image, Job, Matcher, Presentation, Screen, Video, match_width, match_height
+
+
+@click.group()
+def cli():
+    pass
+
+
+if "TF_CPP_MIN_LOG_LEVEL" not in os.environ:
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # disable all logging
+matplotlib.use("TkAgg")
+
+
+@cli.command()
+@click.option("--video", "-v", "video_file_path", type=click.Path(exists=True, dir_okay=False), required=True, help="Path to the video file to process")
+@click.option("--presentation", "-p", "presentation_file_path", type=click.Path(exists=True, dir_okay=False), required=True, help="Path to the PDF file with slides")
+@click.option("--skip-first", "-s", "skip_seconds", type=int, default=0, help="How many seconds to skip from the beginning")
+@click.option("--every", "-e", "every_seconds", type=int, default=1, help="How many seconds to skip between processed frames", show_default=True)
+@click.option("--model-dir", "-m", "model_dir", type=click.Path(exists=True), required=True, help="Path to the directory containing the model's checkpoint")
+@click.option("--labelmap-file", "-l", "labelmap_file", type=click.Path(exists=True), required=True, help="Path to the pbtxt labelmap file")
+@click.option("--further-crop", "further_crop", type=int, nargs=2, default=(25, 25), help="Crop the detected screen further from sides - left/right and top/bottom")
+@click.option("--screen-box", "screen_bounding_box", nargs=4, type=int, default=None, help="Override screen detection by providing bounding box (left,right,top,bottom) in pixels")
+@click.option("--keypoints-matching/--no-keypoints-matching", "keypoints_matching", default=True, help="Match slides using keypoints extraction and matching")
+@click.option("--text-matching/--no-text-matching", "text_matching", default=True, help="Match slides using text extraction and comparison")
+@click.option("--text-weight", "text_weight", type=int, default=2, help="Weight of text matching score in the final match score. Won't be used if not using textual matching", show_default=True)
+@click.option("--keypoints-weight", "keypoints_weight", type=int, default=3, help="Weight of keypoints matching score in the final match score. Won't be used if not using keypoints matching", show_default=True)
+@click.option("--min-match-score", "min_match_score", type=float, default=0.1, help="Minimal match score to be considered a match. [0-1]", show_default=True)
+@click.option("--language", "language", type=str, default=None, help="Slide language for improved text detection and matching")
+@click.option("--interactive", "-i", "interactive", type=bool, is_flag=True, default=False, help="Run interactively, visualizing the processing.")
+@click.option("--job-name", "job_name", type=str, required=True, default="video", help="Name of this job")
+@click.option("--output-dir", "-o", "output_dir", required=True, type=click.Path(file_okay=False), help="Output directory for detected screens, slides and result xml")
+@click.option("--output-compatible", "-oc", "output_compatible", type=bool, is_flag=True, default=False, help="Whether to output XML in old format")
+def process_video(video_file_path, presentation_file_path, skip_seconds, every_seconds, model_dir, labelmap_file, further_crop, min_match_score, screen_bounding_box, keypoints_matching, text_matching, language, text_weight, keypoints_weight, interactive, output_dir, output_compatible, job_name):
+    # finish option validating
+    if len(screen_bounding_box) != 4:
+        screen_bounding_box = None
+
+    if not text_matching and not keypoints_matching:
+        print("You must specify at least one matching method", file=sys.stderr)
+        sys.exit(-1)
+
+    # prepare data sources
+    video = Video(video_file_path)
+    presentation = Presentation(presentation_file_path)
+
+    # create helper objects
+    job = Job(presentation, video, Path(output_dir), job_name)
+    matcher = Matcher.from_images(language, *presentation.pages)
+    detector = None
+    if screen_bounding_box is None:
+        detector = Detector(Path(model_dir), Path(labelmap_file))
+
+    video.forward(skip_seconds)  # skip first couple of seconds of video
+    try:
+        while True:
+            frame_image = video.get_current_frame()
+            if frame_image is None:
+                break
+            frame_image.rescale()
+            frame_image.save()
+
+            print(
+                "================================================================================")
+            print("Processing frame no. {}".format(frame_image.frame_no))
+
+            # Find all screens
+            if screen_bounding_box is not None:
+                frame_image.add_screen(
+                    Screen(screen_bounding_box, frame_image))
+            else:
+                (boxes, scores, classes, num) = detector.detect_objects(frame_image)
+
+                boxes = np.squeeze(boxes)
+                scores = np.squeeze(scores)
+                for i in range(boxes.shape[0]):
+                    if scores[i] < 0.9:
+                        continue
+
+                    box = tuple(boxes[i].tolist())
+                    h, w, d = frame_image.image_data.shape
+                    ymin, xmin, ymax, xmax = box
+                    box = (int(xmin * w) + further_crop[0], int(xmax * w) - further_crop[0],
+                           int(ymin * h) + further_crop[1], int(ymax * h) - further_crop[1])
+                    frame_image.add_screen(
+                        Screen(box, frame_image))
+
+                if interactive:
+                    detected_frame = detector.plot_result(
+                        frame_image, boxes, scores, classes, num)
+                    cv2.imshow("Detection - " +
+                               video_file_path, detected_frame)
+                    if cv2.waitKey(10) == ord("q"):
+                        break
+
+            # Process and match all screens
+            print("Found {} screens".format(len(frame_image.screens)))
+            for i, screen in enumerate(frame_image.screens):
+                print("------------------------------------------------------------")
+                print("Processing screen no. {}".format(i))
+
+                # Determine whether a similar slide was processed in last step
+                previous_hashes = job.get_last_screen_hashes()
+                if screen.hash in previous_hashes:
+                    print(
+                        "Screen no. {}. Skipping... (processed in previous frame)".format(i))
+                    screen.skipped = True
+                    continue
+                for previous_hash in previous_hashes:
+                    if abs(previous_hash - screen.hash) < 12:
+                        print(
+                            "Screen no. {}. Skipping... (similar processed in previous frame)".format(i))
+                        screen.skipped = True
+                        skip = True
+                        break
+                if screen.skipped:
+                    continue
+
+                # match screen to slide
+                match = matcher.match(screen.image,
+                                      do_keypoints=keypoints_matching,
+                                      keypoints_weight=keypoints_weight,
+                                      do_text=text_matching,
+                                      text_weight=text_weight)
+                screen.add_match(match)
+
+                best_match = match.best_match()
+                if best_match is None or best_match[1] < min_match_score:
+                    print("NO BEST MATCH")
+                    # continue
+
+                if interactive:
+                    if best_match is not None:
+                        print("Best:", best_match[0].image_path)
+                    print()
+                    print("All candidates:")
+                    for candidate_match in match.candidates:
+                        print("\t{}\t=> {}".format(
+                            candidate_match[0].image_path, candidate_match[1]))
+
+                    cv2.imshow("Best match: screen-" +
+                               str(i), match.visualize_best())
+                    if cv2.waitKey(10) == ord("q"):
+                        break
+
+            job.add_processed_frame(frame_image)
+            video.forward(every_seconds)
+    except KeyboardInterrupt:
+        print("[W] Premature interrupt")
+        pass
+
+    cv2.destroyAllWindows()
+    job.output(output_compatible)
+
+
+cli.add_command(utils_group)
+if __name__ == "__main__":
+    cli()
